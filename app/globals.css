@@ -24,3 +24,13 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Fix text visibility across all input boxes */
+input, select, textarea {
+  color: #000000 !important;
+  background-color: #ffffff !important;
+}
+
+input::placeholder {
+  color: #6b7280 !important;
+}
