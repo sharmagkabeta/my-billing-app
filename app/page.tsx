@@ -1,11 +1,12 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { supabase } from "@/lib/supabase";
 
 interface Product {
   id: number;
   name: string;
+  barcode: string;
   hsn: string;
   rate: number;
   purchase_rate: number;
@@ -41,38 +42,63 @@ interface InvoiceRecord {
   created_at: string;
 }
 
+interface StoreProfile {
+  store_name: string;
+  gstin: string;
+  phone: string;
+  address: string;
+  upi_id: string;
+  state_code: string;
+}
+
 export default function BillingApp() {
   const [mounted, setMounted] = useState(false);
-  const [activeTab, setActiveTab] = useState<"BILLING" | "INVENTORY" | "KHATA" | "REPORTS">("BILLING");
+  const [user, setUser] = useState<any>(null);
+  const [activeTab, setActiveTab] = useState<"BILLING" | "INVENTORY" | "KHATA" | "REPORTS" | "SETTINGS">("BILLING");
   const [loading, setLoading] = useState(true);
 
-  // Shop Profile Settings
-  const [shopName] = useState("SHARMA TRADERS & GENERAL STORE");
-  const [shopGstin] = useState("23AAAAA0000A1Z5");
-  const [shopAddress] = useState("Shop No. 4, MG Road, Indore, MP - 452001");
-  const [shopPhone] = useState("+91 98765 43210");
-  const [businessState] = useState("23"); // MP
+  // Auth state
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authMode, setAuthMode] = useState<"LOGIN" | "SIGNUP">("LOGIN");
+  const [authError, setAuthError] = useState("");
 
-  // Customer Settings
+  // Store Profile
+  const [profile, setProfile] = useState<StoreProfile>({
+    store_name: "My Store",
+    gstin: "",
+    phone: "",
+    address: "",
+    upi_id: "",
+    state_code: "23",
+  });
+
+  // Customer & Bill
   const [customerState, setCustomerState] = useState("23");
   const [customerName, setCustomerName] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [paymentMode, setPaymentMode] = useState<"CASH" | "UPI" | "CREDIT">("CASH");
 
-  // Database Data
+  // Database Records
   const [inventory, setInventory] = useState<Product[]>([]);
   const [parties, setParties] = useState<CustomerParty[]>([]);
   const [invoices, setInvoices] = useState<InvoiceRecord[]>([]);
 
   // Inventory Form State
   const [newProdName, setNewProdName] = useState("");
+  const [newProdBarcode, setNewProdBarcode] = useState("");
   const [newProdHsn, setNewProdHsn] = useState("");
   const [newProdSaleRate, setNewProdSaleRate] = useState<number | "">("");
   const [newProdPurchaseRate, setNewProdPurchaseRate] = useState<number | "">("");
   const [newProdGst, setNewProdGst] = useState<number>(18);
   const [newProdStock, setNewProdStock] = useState<number | "">("");
 
-  // Quick Payment Collection State for Khata
+  // Barcode Scanning Input for Fast Billing
+  const [barcodeSearch, setBarcodeSearch] = useState("");
+  const [cameraActive, setCameraActive] = useState(false);
+  const scannerRef = useRef<any>(null);
+
+  // Payment Collection State
   const [paymentAmount, setPaymentAmount] = useState<{ [key: number]: number | "" }>({});
 
   // Current Bill Items
@@ -86,25 +112,149 @@ export default function BillingApp() {
     setMounted(true);
     setCurrentInvoiceNo("INV-" + Math.floor(100000 + Math.random() * 900000));
     setBillDate(new Date().toLocaleDateString("en-IN"));
-    fetchCloudData();
+
+    // Check user session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user) {
+        setUser(session.user);
+        loadUserData(session.user.id);
+      } else {
+        setLoading(false);
+      }
+    });
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.user) {
+        setUser(session.user);
+        loadUserData(session.user.id);
+      } else {
+        setUser(null);
+        setInventory([]);
+        setParties([]);
+        setInvoices([]);
+      }
+    });
+
+    return () => {
+      authListener.subscription.unsubscribe();
+    };
   }, []);
 
-  const fetchCloudData = async () => {
+  const loadUserData = async (userId: string) => {
     setLoading(true);
 
-    const { data: prodData } = await supabase.from("products").select("*").order("id", { ascending: false });
+    // Profile
+    const { data: prof } = await supabase.from("store_profiles").select("*").eq("id", userId).single();
+    if (prof) {
+      setProfile(prof);
+      setCustomerState(prof.state_code || "23");
+    }
+
+    // Inventory
+    const { data: prodData } = await supabase.from("products").select("*").eq("user_id", userId).order("id", { ascending: false });
     if (prodData) setInventory(prodData);
 
-    const { data: partyData } = await supabase.from("parties").select("*").order("id", { ascending: false });
+    // Parties
+    const { data: partyData } = await supabase.from("parties").select("*").eq("user_id", userId).order("id", { ascending: false });
     if (partyData) setParties(partyData);
 
-    const { data: invData } = await supabase.from("invoices").select("*").order("id", { ascending: false });
+    // Invoices
+    const { data: invData } = await supabase.from("invoices").select("*").eq("user_id", userId).order("id", { ascending: false });
     if (invData) setInvoices(invData);
 
     setLoading(false);
   };
 
-  // Add Item to Bill
+  // Auth Handlers
+  const handleAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    if (authMode === "SIGNUP") {
+      const { data, error } = await supabase.auth.signUp({
+        email: authEmail,
+        password: authPassword,
+      });
+      if (error) setAuthError(error.message);
+      else if (data.user) alert("Account registered! You can now log in.");
+    } else {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: authEmail,
+        password: authPassword,
+      });
+      if (error) setAuthError(error.message);
+    }
+  };
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+  };
+
+  // Profile Save
+  const handleSaveProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user) return;
+    const { error } = await supabase.from("store_profiles").upsert({
+      id: user.id,
+      ...profile,
+      updated_at: new Date().toISOString(),
+    });
+    if (error) alert("Error saving profile: " + error.message);
+    else alert("Store details updated successfully!");
+  };
+
+  // Barcode Handler (Fast Add Item by Barcode or USB Scanner)
+  const handleBarcodeLookup = (code: string) => {
+    if (!code) return;
+    const match = inventory.find((p) => p.barcode?.trim() === code.trim());
+    if (match) {
+      const emptyIdx = items.findIndex((it) => !it.name);
+      const targetIdx = emptyIdx !== -1 ? emptyIdx : items.length;
+
+      const updated = [...items];
+      updated[targetIdx] = {
+        productId: match.id,
+        name: match.name,
+        hsn: match.hsn,
+        qty: 1,
+        rate: Number(match.rate),
+        gstRate: Number(match.gst_rate),
+      };
+      setItems(updated);
+      setBarcodeSearch("");
+    } else {
+      alert(`No product found with Barcode: ${code}`);
+    }
+  };
+
+  // Camera Barcode Scanner Start/Stop
+  const toggleCameraScanner = async () => {
+    if (cameraActive) {
+      if (scannerRef.current) {
+        await scannerRef.current.stop();
+        scannerRef.current = null;
+      }
+      setCameraActive(false);
+    } else {
+      setCameraActive(true);
+      setTimeout(async () => {
+        const { Html5Qrcode } = await import("html5-qrcode");
+        const scanner = new Html5Qrcode("reader");
+        scannerRef.current = scanner;
+        await scanner.start(
+          { facingMode: "environment" },
+          { fps: 10, qrbox: { width: 250, height: 150 } },
+          (decodedText) => {
+            handleBarcodeLookup(decodedText);
+            scanner.stop();
+            setCameraActive(false);
+          },
+          undefined
+        );
+      }, 200);
+    }
+  };
+
+  // Bill Row Operations
   const addItemRow = () => {
     setItems([...items, { name: "", hsn: "", qty: 1, rate: 0, gstRate: 18 }]);
   };
@@ -112,7 +262,6 @@ export default function BillingApp() {
   const selectProductForItem = (index: number, productId: number) => {
     const selected = inventory.find((p) => p.id === productId);
     if (!selected) return;
-
     const updated = [...items];
     updated[index] = {
       productId: selected.id,
@@ -135,9 +284,10 @@ export default function BillingApp() {
     setItems(items.filter((_, i) => i !== index));
   };
 
-  // Add/Update Product
+  // Inventory Save
   const handleAddNewProduct = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!user) return;
     const trimmedName = newProdName.trim();
     if (!trimmedName) return alert("Enter Product Name");
 
@@ -149,7 +299,7 @@ export default function BillingApp() {
 
     if (existingProduct) {
       const confirmAdd = window.confirm(
-        `"${existingProduct.name}" already exists with ${existingProduct.stock} in stock.\n\nAdd +${stockToAdd} stock to existing product?`
+        `"${existingProduct.name}" already exists with ${existingProduct.stock} stock.\n\nAdd +${stockToAdd} stock?`
       );
 
       if (confirmAdd) {
@@ -162,22 +312,26 @@ export default function BillingApp() {
             stock: newTotalStock,
             rate: updatedRate,
             hsn: newProdHsn || existingProduct.hsn,
+            barcode: newProdBarcode || existingProduct.barcode,
             gst_rate: Number(newProdGst),
           })
           .eq("id", existingProduct.id);
 
-        alert(`Stock updated! New total stock: ${newTotalStock}`);
+        alert(`Stock updated! New total: ${newTotalStock}`);
         setNewProdName("");
+        setNewProdBarcode("");
         setNewProdHsn("");
         setNewProdSaleRate("");
         setNewProdStock("");
-        fetchCloudData();
+        loadUserData(user.id);
       }
       return;
     }
 
     const newProd = {
+      user_id: user.id,
       name: trimmedName,
+      barcode: newProdBarcode.trim(),
       hsn: newProdHsn || "9999",
       rate: Number(newProdSaleRate) || 0,
       purchase_rate: Number(newProdPurchaseRate) || 0,
@@ -186,18 +340,16 @@ export default function BillingApp() {
     };
 
     const { error } = await supabase.from("products").insert([newProd]);
-    if (error) {
-      alert("Error: " + error.message);
-      return;
-    }
+    if (error) return alert("Error: " + error.message);
 
-    alert("New product saved!");
+    alert("New product saved to your store!");
     setNewProdName("");
+    setNewProdBarcode("");
     setNewProdHsn("");
     setNewProdSaleRate("");
     setNewProdPurchaseRate("");
     setNewProdStock("");
-    fetchCloudData();
+    loadUserData(user.id);
   };
 
   const handleDeleteProduct = async (productId: number, productName: string) => {
@@ -206,8 +358,8 @@ export default function BillingApp() {
     setInventory(inventory.filter((p) => p.id !== productId));
   };
 
-  // Bill Calculations
-  const isIntraState = businessState === customerState;
+  // Calculations
+  const isIntraState = profile.state_code === customerState;
   const subtotal = items.reduce((acc, item) => acc + item.qty * item.rate, 0);
 
   let cgstTotal = 0;
@@ -227,16 +379,15 @@ export default function BillingApp() {
   const grandTotal = Math.round(subtotal + cgstTotal + sgstTotal + igstTotal);
   const totalTax = cgstTotal + sgstTotal + igstTotal;
 
-  // Save Bill & Print
+  // Save Bill
   const handleSaveAndPrint = async () => {
-    if (!customerName.trim()) {
-      alert("Please enter Customer Name");
-      return;
-    }
+    if (!user) return;
+    if (!customerName.trim()) return alert("Enter Customer Name");
 
     const invNo = currentInvoiceNo;
     const { error: invErr } = await supabase.from("invoices").insert([
       {
+        user_id: user.id,
         invoice_number: invNo,
         customer_name: customerName,
         customer_phone: customerPhone,
@@ -247,10 +398,7 @@ export default function BillingApp() {
       },
     ]);
 
-    if (invErr) {
-      alert("Error saving bill: " + invErr.message);
-      return;
-    }
+    if (invErr) return alert("Error saving bill: " + invErr.message);
 
     // Deduct stock
     for (const item of items) {
@@ -275,6 +423,7 @@ export default function BillingApp() {
       } else {
         await supabase.from("parties").insert([
           {
+            user_id: user.id,
             name: customerName,
             phone: customerPhone || "N/A",
             balance_due: grandTotal,
@@ -283,7 +432,7 @@ export default function BillingApp() {
       }
     }
 
-    fetchCloudData();
+    loadUserData(user.id);
 
     setTimeout(() => {
       window.print();
@@ -292,6 +441,7 @@ export default function BillingApp() {
   };
 
   const handleReceivePayment = async (party: CustomerParty) => {
+    if (!user) return;
     const amt = Number(paymentAmount[party.id]);
     if (!amt || amt <= 0) return alert("Enter valid payment amount");
 
@@ -299,15 +449,83 @@ export default function BillingApp() {
     await supabase.from("parties").update({ balance_due: newBalance }).eq("id", party.id);
 
     setPaymentAmount({ ...paymentAmount, [party.id]: "" });
-    fetchCloudData();
+    loadUserData(user.id);
     alert("Payment recorded successfully!");
   };
 
-  if (!mounted) {
-    return <div className="min-h-screen bg-gray-100 flex items-center justify-center text-gray-500">Loading Billing System...</div>;
+  if (!mounted) return null;
+
+  // =================== AUTHENTICATION SCREEN ===================
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-white rounded-xl shadow-2xl p-8 space-y-6">
+          <div className="text-center">
+            <h1 className="text-3xl font-extrabold text-blue-600">VyaparFlow</h1>
+            <p className="text-sm text-gray-500 mt-1">Multi-Shop Cloud GST Billing & POS</p>
+          </div>
+
+          {authError && (
+            <div className="bg-red-50 text-red-700 text-xs p-3 rounded border border-red-200">
+              {authError}
+            </div>
+          )}
+
+          <form onSubmit={handleAuth} className="space-y-4">
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">Email Address</label>
+              <input
+                type="email"
+                required
+                placeholder="storeowner@gmail.com"
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+                className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-blue-600"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">Password</label>
+              <input
+                type="password"
+                required
+                placeholder="••••••••"
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+                className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-blue-600"
+              />
+            </div>
+
+            <button
+              type="submit"
+              className="w-full bg-blue-600 text-white font-bold py-2.5 rounded-lg hover:bg-blue-700 transition"
+            >
+              {authMode === "LOGIN" ? "Sign In to Store" : "Create New Store Account"}
+            </button>
+          </form>
+
+          <div className="text-center text-xs text-gray-500">
+            {authMode === "LOGIN" ? (
+              <p>
+                Don't have a store account?{" "}
+                <button onClick={() => setAuthMode("SIGNUP")} className="text-blue-600 font-bold hover:underline">
+                  Register here
+                </button>
+              </p>
+            ) : (
+              <p>
+                Already have an account?{" "}
+                <button onClick={() => setAuthMode("LOGIN")} className="text-blue-600 font-bold hover:underline">
+                  Sign In
+                </button>
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+    );
   }
 
-  // Reports Summary Metrics
+  // Summary Metrics
   const totalSalesRevenue = invoices.reduce((sum, inv) => sum + Number(inv.grand_total || 0), 0);
   const totalCashCollected = invoices
     .filter((inv) => inv.payment_mode === "CASH")
@@ -323,12 +541,15 @@ export default function BillingApp() {
       <div className="max-w-5xl mx-auto space-y-6">
 
         {/* Top Navbar */}
-        <header className="print:hidden flex flex-col sm:flex-row justify-between items-center bg-white p-4 rounded-lg shadow-sm">
-          <div className="flex items-center space-x-2 mb-3 sm:mb-0">
-            <span className="text-xl font-extrabold text-blue-600 tracking-tight">VyaparFlow</span>
-            <span className="text-xs bg-green-100 text-green-800 font-semibold px-2 py-0.5 rounded">
-              ☁ Cloud Sync Active
-            </span>
+        <header className="print:hidden flex flex-col sm:flex-row justify-between items-center bg-white p-4 rounded-lg shadow-sm gap-3">
+          <div className="flex items-center space-x-2">
+            <div>
+              <span className="text-xl font-extrabold text-blue-600 tracking-tight">{profile.store_name}</span>
+              <span className="ml-2 text-xs bg-green-100 text-green-800 font-semibold px-2 py-0.5 rounded">
+                ☁ Live
+              </span>
+              <p className="text-xs text-gray-400">{user.email}</p>
+            </div>
           </div>
 
           <div className="flex flex-wrap gap-1 bg-gray-100 p-1 rounded-lg">
@@ -338,7 +559,7 @@ export default function BillingApp() {
                 activeTab === "BILLING" ? "bg-white text-blue-600 shadow" : "text-gray-600"
               }`}
             >
-              📄 New Bill
+              📄 Bill (POS)
             </button>
             <button
               onClick={() => setActiveTab("INVENTORY")}
@@ -354,7 +575,7 @@ export default function BillingApp() {
                 activeTab === "KHATA" ? "bg-white text-blue-600 shadow" : "text-gray-600"
               }`}
             >
-              📒 Customer Udhar (₹{totalOutstandingUdhar.toFixed(0)})
+              📒 Udhar (₹{totalOutstandingUdhar.toFixed(0)})
             </button>
             <button
               onClick={() => setActiveTab("REPORTS")}
@@ -362,271 +583,109 @@ export default function BillingApp() {
                 activeTab === "REPORTS" ? "bg-white text-blue-600 shadow" : "text-gray-600"
               }`}
             >
-              📊 Reports & Day Book
+              📊 Reports
+            </button>
+            <button
+              onClick={() => setActiveTab("SETTINGS")}
+              className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-md transition ${
+                activeTab === "SETTINGS" ? "bg-white text-blue-600 shadow" : "text-gray-600"
+              }`}
+            >
+              ⚙️️ Settings
+            </button>
+            <button
+              onClick={handleLogout}
+              className="px-2 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 rounded"
+              title="Logout"
+            >
+              Logout
             </button>
           </div>
         </header>
 
-        {loading && (
-          <div className="print:hidden p-2 bg-blue-50 text-blue-700 text-xs rounded text-center font-medium">
-            Syncing database...
+        {/* =================== TAB: STORE PROFILE SETTINGS =================== */}
+        {activeTab === "SETTINGS" && (
+          <div className="print:hidden bg-white p-6 rounded-lg shadow border space-y-6">
+            <div>
+              <h2 className="text-xl font-bold text-gray-800">Store Profile & GST Configuration</h2>
+              <p className="text-xs text-gray-500">This information will appear on all your printed invoices and UPI QR slips.</p>
+            </div>
+
+            <form onSubmit={handleSaveProfile} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-semibold text-gray-600 mb-1">Business / Store Name *</label>
+                <input
+                  type="text"
+                  required
+                  value={profile.store_name}
+                  onChange={(e) => setProfile({ ...profile, store_name: e.target.value })}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-gray-600 mb-1">GSTIN Number</label>
+                <input
+                  type="text"
+                  placeholder="23AAAAA0000A1Z5"
+                  value={profile.gstin}
+                  onChange={(e) => setProfile({ ...profile, gstin: e.target.value.toUpperCase() })}
+                  className="w-full border rounded px-3 py-2 text-sm uppercase"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-gray-600 mb-1">Phone Number</label>
+                <input
+                  type="text"
+                  value={profile.phone}
+                  onChange={(e) => setProfile({ ...profile, phone: e.target.value })}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-gray-600 mb-1">UPI ID (For Instant Customer Payment)</label>
+                <input
+                  type="text"
+                  placeholder="yourstore@upi"
+                  value={profile.upi_id}
+                  onChange={(e) => setProfile({ ...profile, upi_id: e.target.value })}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                />
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-xs font-semibold text-gray-600 mb-1">Full Store Address</label>
+                <textarea
+                  rows={2}
+                  value={profile.address}
+                  onChange={(e) => setProfile({ ...profile, address: e.target.value })}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-gray-600 mb-1">Home State Code (For CGST/SGST determination)</label>
+                <select
+                  value={profile.state_code}
+                  onChange={(e) => setProfile({ ...profile, state_code: e.target.value })}
+                  className="w-full border rounded px-3 py-2 text-sm"
+                >
+                  <option value="23">23 - Madhya Pradesh</option>
+                  <option value="27">27 - Maharashtra</option>
+                  <option value="07">07 - Delhi</option>
+                  <option value="09">09 - Uttar Pradesh</option>
+                  <option value="24">24 - Gujarat</option>
+                  <option value="08">08 - Rajasthan</option>
+                </select>
+              </div>
+
+              <div className="md:col-span-2 flex justify-end">
+                <button type="submit" className="bg-blue-600 text-white font-bold px-6 py-2 rounded shadow hover:bg-blue-700">
+                  Save Store Profile
+                </button>
+              </div>
+            </form>
           </div>
         )}
 
-        {/* =================== TAB: REPORTS & DAY BOOK =================== */}
-        {activeTab === "REPORTS" && (
-          <div className="print:hidden space-y-6">
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div className="bg-white p-4 rounded-lg shadow border-l-4 border-blue-600">
-                <div className="text-xs text-gray-500 font-bold uppercase">Total Lifetime Sales</div>
-                <div className="text-2xl font-extrabold text-blue-700">₹{totalSalesRevenue.toFixed(2)}</div>
-                <div className="text-xs text-gray-400 mt-1">{invoices.length} Invoices Generated</div>
-              </div>
-              <div className="bg-white p-4 rounded-lg shadow border-l-4 border-green-600">
-                <div className="text-xs text-gray-500 font-bold uppercase">Cash Collected</div>
-                <div className="text-2xl font-extrabold text-green-700">₹{totalCashCollected.toFixed(2)}</div>
-                <div className="text-xs text-gray-400 mt-1">In cash drawer</div>
-              </div>
-              <div className="bg-white p-4 rounded-lg shadow border-l-4 border-purple-600">
-                <div className="text-xs text-gray-500 font-bold uppercase">UPI / Online</div>
-                <div className="text-2xl font-extrabold text-purple-700">₹{totalUpiCollected.toFixed(2)}</div>
-                <div className="text-xs text-gray-400 mt-1">Direct to Bank</div>
-              </div>
-              <div className="bg-white p-4 rounded-lg shadow border-l-4 border-red-500">
-                <div className="text-xs text-gray-500 font-bold uppercase">Total GST Output</div>
-                <div className="text-2xl font-extrabold text-red-600">₹{totalTaxCollected.toFixed(2)}</div>
-                <div className="text-xs text-gray-400 mt-1">For GSTR-1 Filing</div>
-              </div>
-            </div>
-
-            {/* Invoices History Table */}
-            <div className="bg-white p-6 rounded-lg shadow border">
-              <h2 className="text-lg font-bold text-gray-800 mb-4">Day Book / Invoice History</h2>
-              <div className="overflow-x-auto">
-                <table className="w-full border-collapse text-sm">
-                  <thead>
-                    <tr className="bg-gray-100 text-left text-gray-700">
-                      <th className="p-3 border">Inv No.</th>
-                      <th className="p-3 border">Customer</th>
-                      <th className="p-3 border">Date & Time</th>
-                      <th className="p-3 border">Mode</th>
-                      <th className="p-3 border text-right">Tax (₹)</th>
-                      <th className="p-3 border text-right">Grand Total (₹)</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {invoices.map((inv) => (
-                      <tr key={inv.id} className="border-b hover:bg-gray-50">
-                        <td className="p-3 border font-mono font-semibold text-blue-600">{inv.invoice_number}</td>
-                        <td className="p-3 border font-medium">
-                          {inv.customer_name}
-                          {inv.customer_phone ? ` (${inv.customer_phone})` : ""}
-                        </td>
-                        <td className="p-3 border text-gray-500 text-xs">
-                          {new Date(inv.created_at).toLocaleString("en-IN")}
-                        </td>
-                        <td className="p-3 border">
-                          <span
-                            className={`text-xs px-2 py-0.5 rounded font-semibold ${
-                              inv.payment_mode === "CASH"
-                                ? "bg-green-100 text-green-700"
-                                : inv.payment_mode === "UPI"
-                                ? "bg-purple-100 text-purple-700"
-                                : "bg-red-100 text-red-700"
-                            }`}
-                          >
-                            {inv.payment_mode}
-                          </span>
-                        </td>
-                        <td className="p-3 border text-right text-gray-600">₹{Number(inv.tax_amount).toFixed(2)}</td>
-                        <td className="p-3 border text-right font-bold text-gray-900">
-                          ₹{Number(inv.grand_total).toFixed(2)}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* =================== TAB: INVENTORY =================== */}
-        {activeTab === "INVENTORY" && (
-          <div className="print:hidden space-y-6">
-            <div className="bg-white p-6 rounded-lg shadow border">
-              <h2 className="text-lg font-bold text-gray-800 mb-1">Add or Update Stock</h2>
-              <p className="text-xs text-gray-500 mb-4">
-                If the product already exists, saving will automatically increase the stock quantity.
-              </p>
-              <form onSubmit={handleAddNewProduct} className="grid grid-cols-1 sm:grid-cols-3 md:grid-cols-6 gap-3">
-                <div className="sm:col-span-2">
-                  <label className="block text-xs font-semibold text-gray-600 mb-1">Item Name *</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="Product name"
-                    value={newProdName}
-                    onChange={(e) => setNewProdName(e.target.value)}
-                    className="w-full border rounded px-3 py-1.5 text-sm"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-gray-600 mb-1">HSN</label>
-                  <input
-                    type="text"
-                    placeholder="HSN"
-                    value={newProdHsn}
-                    onChange={(e) => setNewProdHsn(e.target.value)}
-                    className="w-full border rounded px-3 py-1.5 text-sm"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-gray-600 mb-1">Sale Rate (₹)</label>
-                  <input
-                    type="number"
-                    placeholder="0.00"
-                    value={newProdSaleRate}
-                    onChange={(e) => setNewProdSaleRate(e.target.value === "" ? "" : Number(e.target.value))}
-                    className="w-full border rounded px-3 py-1.5 text-sm"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-gray-600 mb-1">GST %</label>
-                  <select
-                    value={newProdGst}
-                    onChange={(e) => setNewProdGst(Number(e.target.value))}
-                    className="w-full border rounded px-3 py-1.5 text-sm"
-                  >
-                    <option value={0}>0%</option>
-                    <option value={5}>5%</option>
-                    <option value={12}>12%</option>
-                    <option value={18}>18%</option>
-                    <option value={28}>28%</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-gray-600 mb-1">Stock Qty to Add</label>
-                  <input
-                    type="number"
-                    placeholder="0"
-                    value={newProdStock}
-                    onChange={(e) => setNewProdStock(e.target.value === "" ? "" : Number(e.target.value))}
-                    className="w-full border rounded px-3 py-1.5 text-sm"
-                  />
-                </div>
-                <div className="sm:col-span-6 flex justify-end mt-2">
-                  <button type="submit" className="bg-blue-600 text-white font-semibold px-5 py-2 rounded text-sm shadow hover:bg-blue-700">
-                    + Save to Stock
-                  </button>
-                </div>
-              </form>
-            </div>
-
-            <div className="bg-white p-6 rounded-lg shadow border">
-              <h2 className="text-lg font-bold text-gray-800 mb-4">Stock Ledger</h2>
-              <table className="w-full border-collapse text-sm">
-                <thead>
-                  <tr className="bg-gray-100 text-left text-gray-700">
-                    <th className="p-3 border">Item Name</th>
-                    <th className="p-3 border">HSN</th>
-                    <th className="p-3 border text-right">Sale Price</th>
-                    <th className="p-3 border text-center">GST %</th>
-                    <th className="p-3 border text-center">Current Stock</th>
-                    <th className="p-3 border text-center w-24">Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {inventory.map((prod) => (
-                    <tr key={prod.id} className="border-b hover:bg-gray-50">
-                      <td className="p-3 border font-medium">{prod.name}</td>
-                      <td className="p-3 border text-gray-600">{prod.hsn}</td>
-                      <td className="p-3 border text-right font-semibold">₹{Number(prod.rate).toFixed(2)}</td>
-                      <td className="p-3 border text-center">{prod.gst_rate}%</td>
-                      <td className="p-3 border text-center font-bold text-base">{prod.stock}</td>
-                      <td className="p-3 border text-center">
-                        <button
-                          onClick={() => handleDeleteProduct(prod.id, prod.name)}
-                          className="text-red-500 hover:text-red-700 font-semibold text-xs px-2 py-1 rounded border border-red-200 hover:bg-red-50"
-                        >
-                          Delete
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {/* =================== TAB: KHATA =================== */}
-        {activeTab === "KHATA" && (
-          <div className="print:hidden space-y-6">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className="bg-white p-5 rounded-lg shadow border-l-4 border-red-500">
-                <div className="text-xs text-gray-500 font-bold uppercase">Total Udhar to Collect</div>
-                <div className="text-3xl font-extrabold text-red-600">₹{totalOutstandingUdhar.toFixed(2)}</div>
-              </div>
-              <div className="bg-white p-5 rounded-lg shadow border-l-4 border-blue-500">
-                <div className="text-xs text-gray-500 font-bold uppercase">Registered Customers</div>
-                <div className="text-3xl font-extrabold text-gray-800">{parties.length} Accounts</div>
-              </div>
-            </div>
-
-            <div className="bg-white p-6 rounded-lg shadow border">
-              <h2 className="text-lg font-bold text-gray-800 mb-4">Customer Udhar Ledger</h2>
-              <div className="overflow-x-auto">
-                <table className="w-full border-collapse text-sm">
-                  <thead>
-                    <tr className="bg-gray-100 text-left text-gray-700">
-                      <th className="p-3 border">Customer Name</th>
-                      <th className="p-3 border">Phone</th>
-                      <th className="p-3 border text-right">Balance Due</th>
-                      <th className="p-3 border text-center">Receive Jama (₹)</th>
-                      <th className="p-3 border text-center">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {parties.map((party) => (
-                      <tr key={party.id} className="border-b hover:bg-gray-50">
-                        <td className="p-3 border font-semibold">{party.name}</td>
-                        <td className="p-3 border text-gray-600">{party.phone}</td>
-                        <td className="p-3 border text-right font-bold text-red-600">
-                          ₹{Number(party.balance_due).toFixed(2)}
-                        </td>
-                        <td className="p-3 border text-center">
-                          <input
-                            type="number"
-                            placeholder="₹ Amount"
-                            value={paymentAmount[party.id] ?? ""}
-                            onChange={(e) =>
-                              setPaymentAmount({
-                                ...paymentAmount,
-                                [party.id]: e.target.value === "" ? "" : Number(e.target.value),
-                              })
-                            }
-                            className="w-28 border rounded px-2 py-1 text-sm text-center"
-                          />
-                        </td>
-                        <td className="p-3 border text-center space-x-2">
-                          <button
-                            onClick={() => handleReceivePayment(party)}
-                            className="bg-emerald-600 text-white text-xs px-3 py-1.5 rounded font-semibold hover:bg-emerald-700"
-                          >
-                            Collect Cash
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* =================== TAB: BILLING & TAX INVOICE =================== */}
+        {/* =================== TAB: BILLING & POS (WITH BARCODE SCANNING) =================== */}
         {activeTab === "BILLING" && (
           <div className="bg-white rounded-lg shadow p-4 md:p-8 print:p-0 print:shadow-none print:border-none border">
 
@@ -634,10 +693,10 @@ export default function BillingApp() {
             <div className="hidden print:block border-b-2 border-black pb-4 mb-4">
               <div className="flex justify-between items-start">
                 <div>
-                  <h1 className="text-xl font-black tracking-tight">{shopName}</h1>
-                  <p className="text-xs text-gray-700">{shopAddress}</p>
-                  <p className="text-xs font-semibold">Phone: {shopPhone}</p>
-                  <p className="text-xs font-bold mt-1">GSTIN: {shopGstin}</p>
+                  <h1 className="text-xl font-black tracking-tight">{profile.store_name}</h1>
+                  <p className="text-xs text-gray-700">{profile.address}</p>
+                  <p className="text-xs font-semibold">Phone: {profile.phone}</p>
+                  {profile.gstin && <p className="text-xs font-bold mt-1">GSTIN: {profile.gstin}</p>}
                 </div>
                 <div className="text-right">
                   <span className="border-2 border-black font-black text-sm px-3 py-1 uppercase inline-block">
@@ -650,18 +709,60 @@ export default function BillingApp() {
             </div>
 
             {/* Screen Header */}
-            <div className="print:hidden flex justify-between items-center border-b pb-4 mb-6">
+            <div className="print:hidden flex justify-between items-center border-b pb-4 mb-4">
               <div>
-                <h1 className="text-2xl font-bold text-gray-800">Quick Counter Bill</h1>
-                <p className="text-xs text-gray-500">Live GST billing synced to cloud</p>
+                <h1 className="text-2xl font-bold text-gray-800">Quick Counter POS</h1>
+                <p className="text-xs text-gray-500">Scan barcodes or pick stock for instant billing</p>
               </div>
               <button
                 onClick={handleSaveAndPrint}
-                className="bg-emerald-600 text-white px-6 py-2.5 rounded font-semibold hover:bg-emerald-700 shadow flex items-center space-x-2"
+                className="bg-emerald-600 text-white px-6 py-2.5 rounded font-semibold hover:bg-emerald-700 shadow"
               >
-                <span>🖨️ Save & Print Bill</span>
+                🖨️ Save & Print Bill
               </button>
             </div>
+
+            {/* Fast Barcode Scanner Toolbar */}
+            <div className="print:hidden bg-slate-50 border p-3 rounded-lg mb-6 flex flex-col sm:flex-row items-center gap-3">
+              <div className="flex-1 w-full flex gap-2">
+                <input
+                  type="text"
+                  placeholder="⚡ Scan Barcode or type & press Enter..."
+                  value={barcodeSearch}
+                  onChange={(e) => setBarcodeSearch(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      handleBarcodeLookup(barcodeSearch);
+                    }
+                  }}
+                  className="w-full border rounded px-3 py-2 text-sm bg-white font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => handleBarcodeLookup(barcodeSearch)}
+                  className="bg-blue-600 text-white text-xs px-4 py-2 rounded font-semibold"
+                >
+                  Lookup
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={toggleCameraScanner}
+                className={`w-full sm:w-auto text-xs px-4 py-2 rounded font-bold transition flex items-center justify-center gap-1 ${
+                  cameraActive ? "bg-red-600 text-white" : "bg-purple-600 text-white"
+                }`}
+              >
+                📷 {cameraActive ? "Stop Camera" : "Open Camera Scanner"}
+              </button>
+            </div>
+
+            {/* Camera Viewport */}
+            {cameraActive && (
+              <div className="print:hidden mb-4 p-3 border rounded bg-black flex flex-col items-center">
+                <div id="reader" className="w-full max-w-sm"></div>
+                <p className="text-white text-xs mt-2">Point camera at product barcode</p>
+              </div>
+            )}
 
             {/* Customer Inputs */}
             <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 mb-6 print:border print:p-3 print:mb-4 print:text-xs">
@@ -690,11 +791,10 @@ export default function BillingApp() {
                 <select
                   value={customerState}
                   onChange={(e) => setCustomerState(e.target.value)}
-                  className="w-full border rounded px-3 py-2 text-sm print:border-none print:p-0 print:font-semibold"
+                  className="w-full border rounded px-3 py-2 text-sm print:border-none print:p-0"
                 >
-                  <option value="23">23 - Madhya Pradesh (CGST + SGST)</option>
-                  <option value="27">27 - Maharashtra (IGST)</option>
-                  <option value="07">07 - Delhi (IGST)</option>
+                  <option value={profile.state_code}>Same State (CGST + SGST)</option>
+                  <option value="99">Other State (IGST)</option>
                 </select>
               </div>
               <div>
@@ -812,7 +912,7 @@ export default function BillingApp() {
               + Add Item Row
             </button>
 
-            {/* Calculations & Signatory Block */}
+            {/* Calculations & Print Footer */}
             <div className="border-t pt-4 flex flex-col md:flex-row justify-between items-start md:items-end print:text-xs">
               <div className="mb-4 md:mb-0 space-y-2">
                 <div>
@@ -821,7 +921,15 @@ export default function BillingApp() {
                     {paymentMode === "CREDIT" ? "⚠️ Udhar / Khata" : `Paid via ${paymentMode}`}
                   </span>
                 </div>
-                <div className="hidden print:block pt-8">
+
+                {/* Print UPI QR Code placeholder if UPI configured */}
+                {profile.upi_id && (
+                  <div className="hidden print:block pt-2">
+                    <p className="text-[10px] text-gray-500">Pay via UPI to: <b>{profile.upi_id}</b></p>
+                  </div>
+                )}
+
+                <div className="hidden print:block pt-6">
                   <p className="text-xs text-gray-500">Thank you for your business!</p>
                   <p className="text-xs font-bold mt-4 pt-4 border-t border-gray-400">Authorized Signatory</p>
                 </div>
@@ -857,6 +965,250 @@ export default function BillingApp() {
             </div>
           </div>
         )}
+
+        {/* =================== TAB: INVENTORY (WITH BARCODE FIELD) =================== */}
+        {activeTab === "INVENTORY" && (
+          <div className="print:hidden space-y-6">
+            <div className="bg-white p-6 rounded-lg shadow border">
+              <h2 className="text-lg font-bold text-gray-800 mb-1">Add or Update Stock</h2>
+              <form onSubmit={handleAddNewProduct} className="grid grid-cols-1 sm:grid-cols-3 md:grid-cols-7 gap-3">
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-semibold text-gray-600 mb-1">Item Name *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Product name"
+                    value={newProdName}
+                    onChange={(e) => setNewProdName(e.target.value)}
+                    className="w-full border rounded px-3 py-1.5 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-gray-600 mb-1">Barcode / SKU</label>
+                  <input
+                    type="text"
+                    placeholder="8901030..."
+                    value={newProdBarcode}
+                    onChange={(e) => setNewProdBarcode(e.target.value)}
+                    className="w-full border rounded px-3 py-1.5 text-sm font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-gray-600 mb-1">HSN</label>
+                  <input
+                    type="text"
+                    placeholder="HSN"
+                    value={newProdHsn}
+                    onChange={(e) => setNewProdHsn(e.target.value)}
+                    className="w-full border rounded px-3 py-1.5 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-gray-600 mb-1">Sale Rate (₹)</label>
+                  <input
+                    type="number"
+                    placeholder="0.00"
+                    value={newProdSaleRate}
+                    onChange={(e) => setNewProdSaleRate(e.target.value === "" ? "" : Number(e.target.value))}
+                    className="w-full border rounded px-3 py-1.5 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-gray-600 mb-1">GST %</label>
+                  <select
+                    value={newProdGst}
+                    onChange={(e) => setNewProdGst(Number(e.target.value))}
+                    className="w-full border rounded px-3 py-1.5 text-sm"
+                  >
+                    <option value={0}>0%</option>
+                    <option value={5}>5%</option>
+                    <option value={12}>12%</option>
+                    <option value={18}>18%</option>
+                    <option value={28}>28%</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-gray-600 mb-1">Stock Qty</label>
+                  <input
+                    type="number"
+                    placeholder="0"
+                    value={newProdStock}
+                    onChange={(e) => setNewProdStock(e.target.value === "" ? "" : Number(e.target.value))}
+                    className="w-full border rounded px-3 py-1.5 text-sm"
+                  />
+                </div>
+                <div className="sm:col-span-7 flex justify-end mt-2">
+                  <button type="submit" className="bg-blue-600 text-white font-semibold px-5 py-2 rounded text-sm shadow hover:bg-blue-700">
+                    + Save to Stock
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            <div className="bg-white p-6 rounded-lg shadow border">
+              <h2 className="text-lg font-bold text-gray-800 mb-4">Stock Ledger</h2>
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="bg-gray-100 text-left text-gray-700">
+                    <th className="p-3 border">Item Name</th>
+                    <th className="p-3 border">Barcode</th>
+                    <th className="p-3 border">HSN</th>
+                    <th className="p-3 border text-right">Sale Price</th>
+                    <th className="p-3 border text-center">GST %</th>
+                    <th className="p-3 border text-center">Stock</th>
+                    <th className="p-3 border text-center w-24">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {inventory.map((prod) => (
+                    <tr key={prod.id} className="border-b hover:bg-gray-50">
+                      <td className="p-3 border font-medium">{prod.name}</td>
+                      <td className="p-3 border font-mono text-xs text-gray-500">{prod.barcode || "-"}</td>
+                      <td className="p-3 border text-gray-600">{prod.hsn}</td>
+                      <td className="p-3 border text-right font-semibold">₹{Number(prod.rate).toFixed(2)}</td>
+                      <td className="p-3 border text-center">{prod.gst_rate}%</td>
+                      <td className="p-3 border text-center font-bold">{prod.stock}</td>
+                      <td className="p-3 border text-center">
+                        <button
+                          onClick={() => handleDeleteProduct(prod.id, prod.name)}
+                          className="text-red-500 hover:text-red-700 text-xs px-2 py-1 rounded border border-red-200"
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* =================== TAB: KHATA =================== */}
+        {activeTab === "KHATA" && (
+          <div className="print:hidden space-y-6">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div className="bg-white p-5 rounded-lg shadow border-l-4 border-red-500">
+                <div className="text-xs text-gray-500 font-bold uppercase">Total Udhar to Collect</div>
+                <div className="text-3xl font-extrabold text-red-600">₹{totalOutstandingUdhar.toFixed(2)}</div>
+              </div>
+              <div className="bg-white p-5 rounded-lg shadow border-l-4 border-blue-500">
+                <div className="text-xs text-gray-500 font-bold uppercase">Registered Customers</div>
+                <div className="text-3xl font-extrabold text-gray-800">{parties.length} Accounts</div>
+              </div>
+            </div>
+
+            <div className="bg-white p-6 rounded-lg shadow border">
+              <h2 className="text-lg font-bold text-gray-800 mb-4">Customer Udhar Ledger</h2>
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse text-sm">
+                  <thead>
+                    <tr className="bg-gray-100 text-left text-gray-700">
+                      <th className="p-3 border">Customer Name</th>
+                      <th className="p-3 border">Phone</th>
+                      <th className="p-3 border text-right">Balance Due</th>
+                      <th className="p-3 border text-center">Receive Jama (₹)</th>
+                      <th className="p-3 border text-center">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {parties.map((party) => (
+                      <tr key={party.id} className="border-b hover:bg-gray-50">
+                        <td className="p-3 border font-semibold">{party.name}</td>
+                        <td className="p-3 border text-gray-600">{party.phone}</td>
+                        <td className="p-3 border text-right font-bold text-red-600">
+                          ₹{Number(party.balance_due).toFixed(2)}
+                        </td>
+                        <td className="p-3 border text-center">
+                          <input
+                            type="number"
+                            placeholder="₹ Amount"
+                            value={paymentAmount[party.id] ?? ""}
+                            onChange={(e) =>
+                              setPaymentAmount({
+                                ...paymentAmount,
+                                [party.id]: e.target.value === "" ? "" : Number(e.target.value),
+                              })
+                            }
+                            className="w-28 border rounded px-2 py-1 text-sm text-center"
+                          />
+                        </td>
+                        <td className="p-3 border text-center">
+                          <button
+                            onClick={() => handleReceivePayment(party)}
+                            className="bg-emerald-600 text-white text-xs px-3 py-1.5 rounded font-semibold hover:bg-emerald-700"
+                          >
+                            Collect Cash
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* =================== TAB: REPORTS =================== */}
+        {activeTab === "REPORTS" && (
+          <div className="print:hidden space-y-6">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="bg-white p-4 rounded-lg shadow border-l-4 border-blue-600">
+                <div className="text-xs text-gray-500 font-bold uppercase">Total Lifetime Sales</div>
+                <div className="text-2xl font-extrabold text-blue-700">₹{totalSalesRevenue.toFixed(2)}</div>
+                <div className="text-xs text-gray-400 mt-1">{invoices.length} Invoices</div>
+              </div>
+              <div className="bg-white p-4 rounded-lg shadow border-l-4 border-green-600">
+                <div className="text-xs text-gray-500 font-bold uppercase">Cash Collected</div>
+                <div className="text-2xl font-extrabold text-green-700">₹{totalCashCollected.toFixed(2)}</div>
+              </div>
+              <div className="bg-white p-4 rounded-lg shadow border-l-4 border-purple-600">
+                <div className="text-xs text-gray-500 font-bold uppercase">UPI Collected</div>
+                <div className="text-2xl font-extrabold text-purple-700">₹{totalUpiCollected.toFixed(2)}</div>
+              </div>
+              <div className="bg-white p-4 rounded-lg shadow border-l-4 border-red-500">
+                <div className="text-xs text-gray-500 font-bold uppercase">GST Tax Collected</div>
+                <div className="text-2xl font-extrabold text-red-600">₹{totalTaxCollected.toFixed(2)}</div>
+              </div>
+            </div>
+
+            <div className="bg-white p-6 rounded-lg shadow border">
+              <h2 className="text-lg font-bold text-gray-800 mb-4">Invoice History (Day Book)</h2>
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="bg-gray-100 text-left text-gray-700">
+                    <th className="p-3 border">Inv No.</th>
+                    <th className="p-3 border">Customer</th>
+                    <th className="p-3 border">Date & Time</th>
+                    <th className="p-3 border">Mode</th>
+                    <th className="p-3 border text-right">Tax (₹)</th>
+                    <th className="p-3 border text-right">Grand Total (₹)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {invoices.map((inv) => (
+                    <tr key={inv.id} className="border-b hover:bg-gray-50">
+                      <td className="p-3 border font-mono font-semibold text-blue-600">{inv.invoice_number}</td>
+                      <td className="p-3 border font-medium">{inv.customer_name}</td>
+                      <td className="p-3 border text-gray-500 text-xs">
+                        {new Date(inv.created_at).toLocaleString("en-IN")}
+                      </td>
+                      <td className="p-3 border">
+                        <span className="text-xs px-2 py-0.5 rounded font-semibold bg-gray-100">
+                          {inv.payment_mode}
+                        </span>
+                      </td>
+                      <td className="p-3 border text-right">₹{Number(inv.tax_amount).toFixed(2)}</td>
+                      <td className="p-3 border text-right font-bold">₹{Number(inv.grand_total).toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
       </div>
     </div>
   );
