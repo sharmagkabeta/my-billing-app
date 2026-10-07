@@ -153,46 +153,47 @@ export default function BillingApp() {
 
   const loadUserData = async (currentUser: any) => {
     setLoading(true);
-    const userId = currentUser.id;
 
-    // 1. Check if user is staff or owner
-    let effectiveOwnerId = userId;
-    let role: "OWNER" | "CASHIER" = "OWNER";
-
+    // 1. Check if user is in store_staff table
     const { data: staffMatch } = await supabase
       .from("store_staff")
       .select("*")
       .eq("staff_email", currentUser.email)
-      .single();
+      .maybeSingle();
+
+    let role: "OWNER" | "CASHIER" = "OWNER";
+    let targetUserId = currentUser.id;
 
     if (staffMatch) {
-      role = staffMatch.role;
-      // If staff, we can fetch the owner's data if needed, or associate products with owner.
-      // For simplicity in single store setup, we load store profile.
+      role = staffMatch.role; // 'CASHIER' or 'OWNER'
+      targetUserId = staffMatch.owner_user_id; // Link to store owner's data
+    } else {
+      role = "OWNER";
     }
+
     setUserRole(role);
 
-    // 2. Profile
-    const { data: prof } = await supabase.from("store_profiles").select("*").eq("id", userId).single();
+    // 2. Profile (Fetch owner's profile so staff see store name & settings)
+    const { data: prof } = await supabase.from("store_profiles").select("*").eq("id", targetUserId).single();
     if (prof) {
       setProfile(prof);
       setCustomerState(prof.state_code || "23");
     }
 
-    // 3. Inventory
-    const { data: prodData } = await supabase.from("products").select("*").order("id", { ascending: false });
+    // 3. Inventory associated with target store owner
+    const { data: prodData } = await supabase.from("products").select("*").eq("user_id", targetUserId).order("id", { ascending: false });
     if (prodData) setInventory(prodData);
 
     // 4. Parties
-    const { data: partyData } = await supabase.from("parties").select("*").order("id", { ascending: false });
+    const { data: partyData } = await supabase.from("parties").select("*").eq("user_id", targetUserId).order("id", { ascending: false });
     if (partyData) setParties(partyData);
 
     // 5. Invoices
-    const { data: invData } = await supabase.from("invoices").select("*").order("id", { ascending: false });
+    const { data: invData } = await supabase.from("invoices").select("*").eq("user_id", targetUserId).order("id", { ascending: false });
     if (invData) setInvoices(invData);
 
     // 6. Staff List
-    const { data: staffData } = await supabase.from("store_staff").select("*");
+    const { data: staffData } = await supabase.from("store_staff").select("*").eq("owner_user_id", targetUserId);
     if (staffData) setStaffList(staffData);
 
     setLoading(false);
@@ -225,7 +226,7 @@ export default function BillingApp() {
   // Save Store Profile
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user) return;
+    if (!user || userRole !== "OWNER") return;
     const { error } = await supabase.from("store_profiles").upsert({
       id: user.id,
       ...profile,
@@ -238,6 +239,7 @@ export default function BillingApp() {
   // Add Staff Member
   const handleAddStaff = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!user || userRole !== "OWNER") return;
     if (!newStaffEmail.trim()) return;
 
     const { error } = await supabase.from("store_staff").insert([
@@ -257,6 +259,7 @@ export default function BillingApp() {
   };
 
   const handleRemoveStaff = async (staffId: number) => {
+    if (userRole !== "OWNER") return;
     if (!window.confirm("Remove this staff member?")) return;
     await supabase.from("store_staff").delete().eq("id", staffId);
     loadUserData(user);
@@ -345,8 +348,16 @@ export default function BillingApp() {
   // Add Product
   const handleAddNewProduct = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!user) return;
     const trimmedName = newProdName.trim();
     if (!trimmedName) return alert("Enter Product Name");
+
+    // Determine target owner id
+    let targetOwnerId = user.id;
+    if (userRole === "CASHIER") {
+      const { data: staffRec } = await supabase.from("store_staff").select("owner_user_id").eq("staff_email", user.email).single();
+      if (staffRec) targetOwnerId = staffRec.owner_user_id;
+    }
 
     const existingProduct = inventory.find(
       (p) => p.name.trim().toLowerCase() === trimmedName.toLowerCase()
@@ -386,6 +397,7 @@ export default function BillingApp() {
     }
 
     const newProd = {
+      user_id: targetOwnerId,
       name: trimmedName,
       barcode: newProdBarcode.trim(),
       hsn: newProdHsn || "9999",
@@ -409,6 +421,7 @@ export default function BillingApp() {
   };
 
   const handleDeleteProduct = async (productId: number, productName: string) => {
+    if (userRole !== "OWNER") return alert("Only store owners can delete products.");
     if (!window.confirm(`Delete "${productName}"?`)) return;
     await supabase.from("products").delete().eq("id", productId);
     setInventory(inventory.filter((p) => p.id !== productId));
@@ -440,9 +453,16 @@ export default function BillingApp() {
     if (!user) return;
     if (!customerName.trim()) return alert("Enter Customer Name");
 
+    let targetOwnerId = user.id;
+    if (userRole === "CASHIER") {
+      const { data: staffRec } = await supabase.from("store_staff").select("owner_user_id").eq("staff_email", user.email).single();
+      if (staffRec) targetOwnerId = staffRec.owner_user_id;
+    }
+
     const invNo = currentInvoiceNo;
     const { error: invErr } = await supabase.from("invoices").insert([
       {
+        user_id: targetOwnerId,
         invoice_number: invNo,
         customer_name: customerName,
         customer_phone: customerPhone,
@@ -476,6 +496,7 @@ export default function BillingApp() {
       } else {
         await supabase.from("parties").insert([
           {
+            user_id: targetOwnerId,
             name: customerName,
             phone: customerPhone || "N/A",
             balance_due: grandTotal,
@@ -591,7 +612,7 @@ export default function BillingApp() {
           <div className="flex items-center space-x-2">
             <div>
               <span className="text-xl font-extrabold text-blue-600 tracking-tight">{profile.store_name}</span>
-              <span className="ml-2 text-xs bg-purple-100 text-purple-800 font-semibold px-2 py-0.5 rounded uppercase">
+              <span className={`ml-2 text-xs font-semibold px-2 py-0.5 rounded uppercase ${userRole === 'OWNER' ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-800'}`}>
                 {userRole}
               </span>
               <p className="text-xs text-gray-400">{user.email}</p>
@@ -813,11 +834,11 @@ export default function BillingApp() {
           </div>
         )}
 
-        {/* =================== TAB: BILLING & POS (WITH THERMAL & A4 STYLES) =================== */}
+        {/* =================== TAB: BILLING & POS =================== */}
         {activeTab === "BILLING" && (
           <div className={`bg-white rounded-lg shadow border p-4 md:p-8 print:p-0 print:shadow-none print:border-none ${profile.printer_mode === 'THERMAL' ? 'print:max-w-[80mm]' : ''}`}>
 
-            {/* --- THERMAL RECEIPT PRINT HEADER --- */}
+            {/* Thermal Print Header */}
             {profile.printer_mode === 'THERMAL' && (
               <div className="hidden print:block text-center font-mono text-xs pb-2 mb-2 border-b border-dashed border-black space-y-1">
                 <h1 className="text-sm font-black">{profile.store_name}</h1>
@@ -832,7 +853,7 @@ export default function BillingApp() {
               </div>
             )}
 
-            {/* --- A4 TAX INVOICE PRINT HEADER --- */}
+            {/* A4 Print Header */}
             {profile.printer_mode === 'A4' && (
               <div className="hidden print:block border-b-2 border-black pb-4 mb-4">
                 <div className="flex justify-between items-start">
@@ -1190,7 +1211,7 @@ export default function BillingApp() {
                     <th className="p-3 border text-right">Sale Price</th>
                     <th className="p-3 border text-center">GST %</th>
                     <th className="p-3 border text-center">Stock</th>
-                    <th className="p-3 border text-center w-24">Action</th>
+                    {userRole === "OWNER" && <th className="p-3 border text-center w-24">Action</th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -1202,14 +1223,16 @@ export default function BillingApp() {
                       <td className="p-3 border text-right font-semibold">₹{Number(prod.rate).toFixed(2)}</td>
                       <td className="p-3 border text-center">{prod.gst_rate}%</td>
                       <td className="p-3 border text-center font-bold">{prod.stock}</td>
-                      <td className="p-3 border text-center">
-                        <button
-                          onClick={() => handleDeleteProduct(prod.id, prod.name)}
-                          className="text-red-500 hover:text-red-700 text-xs px-2 py-1 rounded border border-red-200"
-                        >
-                          Delete
-                        </button>
-                      </td>
+                      {userRole === "OWNER" && (
+                        <td className="p-3 border text-center">
+                          <button
+                            onClick={() => handleDeleteProduct(prod.id, prod.name)}
+                            className="text-red-500 hover:text-red-700 text-xs px-2 py-1 rounded border border-red-200"
+                          >
+                            Delete
+                          </button>
+                        </td>
+                      )}
                     </tr>
                   ))}
                 </tbody>
