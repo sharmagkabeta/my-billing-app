@@ -49,12 +49,20 @@ interface StoreProfile {
   address: string;
   upi_id: string;
   state_code: string;
+  printer_mode: "A4" | "THERMAL";
+}
+
+interface StaffMember {
+  id: number;
+  staff_email: string;
+  role: "OWNER" | "CASHIER";
 }
 
 export default function BillingApp() {
   const [mounted, setMounted] = useState(false);
   const [user, setUser] = useState<any>(null);
-  const [activeTab, setActiveTab] = useState<"BILLING" | "INVENTORY" | "KHATA" | "REPORTS" | "SETTINGS">("BILLING");
+  const [userRole, setUserRole] = useState<"OWNER" | "CASHIER">("OWNER");
+  const [activeTab, setActiveTab] = useState<"BILLING" | "INVENTORY" | "KHATA" | "REPORTS" | "SETTINGS" | "STAFF">("BILLING");
   const [loading, setLoading] = useState(true);
 
   // Auth state
@@ -63,7 +71,7 @@ export default function BillingApp() {
   const [authMode, setAuthMode] = useState<"LOGIN" | "SIGNUP">("LOGIN");
   const [authError, setAuthError] = useState("");
 
-  // Store Profile
+  // Store Profile & Staff
   const [profile, setProfile] = useState<StoreProfile>({
     store_name: "My Store",
     gstin: "",
@@ -71,7 +79,11 @@ export default function BillingApp() {
     address: "",
     upi_id: "",
     state_code: "23",
+    printer_mode: "THERMAL",
   });
+  const [staffList, setStaffList] = useState<StaffMember[]>([]);
+  const [newStaffEmail, setNewStaffEmail] = useState("");
+  const [newStaffRole, setNewStaffRole] = useState<"CASHIER" | "OWNER">("CASHIER");
 
   // Customer & Bill
   const [customerState, setCustomerState] = useState("23");
@@ -93,7 +105,7 @@ export default function BillingApp() {
   const [newProdGst, setNewProdGst] = useState<number>(18);
   const [newProdStock, setNewProdStock] = useState<number | "">("");
 
-  // Barcode Scanning Input for Fast Billing
+  // Barcode Scanning
   const [barcodeSearch, setBarcodeSearch] = useState("");
   const [cameraActive, setCameraActive] = useState(false);
   const scannerRef = useRef<any>(null);
@@ -113,11 +125,10 @@ export default function BillingApp() {
     setCurrentInvoiceNo("INV-" + Math.floor(100000 + Math.random() * 900000));
     setBillDate(new Date().toLocaleDateString("en-IN"));
 
-    // Check user session
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (session?.user) {
         setUser(session.user);
-        loadUserData(session.user.id);
+        loadUserData(session.user);
       } else {
         setLoading(false);
       }
@@ -126,7 +137,7 @@ export default function BillingApp() {
     const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
       if (session?.user) {
         setUser(session.user);
-        loadUserData(session.user.id);
+        loadUserData(session.user);
       } else {
         setUser(null);
         setInventory([]);
@@ -140,27 +151,49 @@ export default function BillingApp() {
     };
   }, []);
 
-  const loadUserData = async (userId: string) => {
+  const loadUserData = async (currentUser: any) => {
     setLoading(true);
+    const userId = currentUser.id;
 
-    // Profile
+    // 1. Check if user is staff or owner
+    let effectiveOwnerId = userId;
+    let role: "OWNER" | "CASHIER" = "OWNER";
+
+    const { data: staffMatch } = await supabase
+      .from("store_staff")
+      .select("*")
+      .eq("staff_email", currentUser.email)
+      .single();
+
+    if (staffMatch) {
+      role = staffMatch.role;
+      // If staff, we can fetch the owner's data if needed, or associate products with owner.
+      // For simplicity in single store setup, we load store profile.
+    }
+    setUserRole(role);
+
+    // 2. Profile
     const { data: prof } = await supabase.from("store_profiles").select("*").eq("id", userId).single();
     if (prof) {
       setProfile(prof);
       setCustomerState(prof.state_code || "23");
     }
 
-    // Inventory
-    const { data: prodData } = await supabase.from("products").select("*").eq("user_id", userId).order("id", { ascending: false });
+    // 3. Inventory
+    const { data: prodData } = await supabase.from("products").select("*").order("id", { ascending: false });
     if (prodData) setInventory(prodData);
 
-    // Parties
-    const { data: partyData } = await supabase.from("parties").select("*").eq("user_id", userId).order("id", { ascending: false });
+    // 4. Parties
+    const { data: partyData } = await supabase.from("parties").select("*").order("id", { ascending: false });
     if (partyData) setParties(partyData);
 
-    // Invoices
-    const { data: invData } = await supabase.from("invoices").select("*").eq("user_id", userId).order("id", { ascending: false });
+    // 5. Invoices
+    const { data: invData } = await supabase.from("invoices").select("*").order("id", { ascending: false });
     if (invData) setInvoices(invData);
+
+    // 6. Staff List
+    const { data: staffData } = await supabase.from("store_staff").select("*");
+    if (staffData) setStaffList(staffData);
 
     setLoading(false);
   };
@@ -189,7 +222,7 @@ export default function BillingApp() {
     await supabase.auth.signOut();
   };
 
-  // Profile Save
+  // Save Store Profile
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user) return;
@@ -198,11 +231,38 @@ export default function BillingApp() {
       ...profile,
       updated_at: new Date().toISOString(),
     });
-    if (error) alert("Error saving profile: " + error.message);
-    else alert("Store details updated successfully!");
+    if (error) alert("Error: " + error.message);
+    else alert("Store settings updated successfully!");
   };
 
-  // Barcode Handler (Fast Add Item by Barcode or USB Scanner)
+  // Add Staff Member
+  const handleAddStaff = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newStaffEmail.trim()) return;
+
+    const { error } = await supabase.from("store_staff").insert([
+      {
+        owner_user_id: user.id,
+        staff_email: newStaffEmail.trim().toLowerCase(),
+        role: newStaffRole,
+      },
+    ]);
+
+    if (error) alert("Error adding staff: " + error.message);
+    else {
+      alert("Staff member added successfully!");
+      setNewStaffEmail("");
+      loadUserData(user);
+    }
+  };
+
+  const handleRemoveStaff = async (staffId: number) => {
+    if (!window.confirm("Remove this staff member?")) return;
+    await supabase.from("store_staff").delete().eq("id", staffId);
+    loadUserData(user);
+  };
+
+  // Barcode Lookup
   const handleBarcodeLookup = (code: string) => {
     if (!code) return;
     const match = inventory.find((p) => p.barcode?.trim() === code.trim());
@@ -226,7 +286,6 @@ export default function BillingApp() {
     }
   };
 
-  // Camera Barcode Scanner Start/Stop
   const toggleCameraScanner = async () => {
     if (cameraActive) {
       if (scannerRef.current) {
@@ -254,7 +313,6 @@ export default function BillingApp() {
     }
   };
 
-  // Bill Row Operations
   const addItemRow = () => {
     setItems([...items, { name: "", hsn: "", qty: 1, rate: 0, gstRate: 18 }]);
   };
@@ -284,10 +342,9 @@ export default function BillingApp() {
     setItems(items.filter((_, i) => i !== index));
   };
 
-  // Inventory Save
+  // Add Product
   const handleAddNewProduct = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user) return;
     const trimmedName = newProdName.trim();
     if (!trimmedName) return alert("Enter Product Name");
 
@@ -323,13 +380,12 @@ export default function BillingApp() {
         setNewProdHsn("");
         setNewProdSaleRate("");
         setNewProdStock("");
-        loadUserData(user.id);
+        loadUserData(user);
       }
       return;
     }
 
     const newProd = {
-      user_id: user.id,
       name: trimmedName,
       barcode: newProdBarcode.trim(),
       hsn: newProdHsn || "9999",
@@ -342,18 +398,18 @@ export default function BillingApp() {
     const { error } = await supabase.from("products").insert([newProd]);
     if (error) return alert("Error: " + error.message);
 
-    alert("New product saved to your store!");
+    alert("New product saved!");
     setNewProdName("");
     setNewProdBarcode("");
     setNewProdHsn("");
     setNewProdSaleRate("");
     setNewProdPurchaseRate("");
     setNewProdStock("");
-    loadUserData(user.id);
+    loadUserData(user);
   };
 
   const handleDeleteProduct = async (productId: number, productName: string) => {
-    if (!window.confirm(`Delete "${productName}" from stock?`)) return;
+    if (!window.confirm(`Delete "${productName}"?`)) return;
     await supabase.from("products").delete().eq("id", productId);
     setInventory(inventory.filter((p) => p.id !== productId));
   };
@@ -387,7 +443,6 @@ export default function BillingApp() {
     const invNo = currentInvoiceNo;
     const { error: invErr } = await supabase.from("invoices").insert([
       {
-        user_id: user.id,
         invoice_number: invNo,
         customer_name: customerName,
         customer_phone: customerPhone,
@@ -400,7 +455,6 @@ export default function BillingApp() {
 
     if (invErr) return alert("Error saving bill: " + invErr.message);
 
-    // Deduct stock
     for (const item of items) {
       if (item.productId) {
         const prod = inventory.find((p) => p.id === item.productId);
@@ -411,7 +465,6 @@ export default function BillingApp() {
       }
     }
 
-    // Update Udhar
     if (paymentMode === "CREDIT") {
       const existingParty = parties.find(
         (p) => p.name.toLowerCase() === customerName.toLowerCase() || (customerPhone && p.phone === customerPhone)
@@ -423,7 +476,6 @@ export default function BillingApp() {
       } else {
         await supabase.from("parties").insert([
           {
-            user_id: user.id,
             name: customerName,
             phone: customerPhone || "N/A",
             balance_due: grandTotal,
@@ -432,7 +484,7 @@ export default function BillingApp() {
       }
     }
 
-    loadUserData(user.id);
+    loadUserData(user);
 
     setTimeout(() => {
       window.print();
@@ -441,7 +493,6 @@ export default function BillingApp() {
   };
 
   const handleReceivePayment = async (party: CustomerParty) => {
-    if (!user) return;
     const amt = Number(paymentAmount[party.id]);
     if (!amt || amt <= 0) return alert("Enter valid payment amount");
 
@@ -449,13 +500,13 @@ export default function BillingApp() {
     await supabase.from("parties").update({ balance_due: newBalance }).eq("id", party.id);
 
     setPaymentAmount({ ...paymentAmount, [party.id]: "" });
-    loadUserData(user.id);
+    loadUserData(user);
     alert("Payment recorded successfully!");
   };
 
   if (!mounted) return null;
 
-  // =================== AUTHENTICATION SCREEN ===================
+  // Auth Screen
   if (!user) {
     return (
       <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
@@ -480,7 +531,7 @@ export default function BillingApp() {
                 placeholder="storeowner@gmail.com"
                 value={authEmail}
                 onChange={(e) => setAuthEmail(e.target.value)}
-                className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-blue-600"
+                className="w-full border border-gray-300 bg-white text-black font-medium rounded-lg px-3 py-2 text-sm focus:outline-blue-600"
               />
             </div>
             <div>
@@ -491,7 +542,7 @@ export default function BillingApp() {
                 placeholder="••••••••"
                 value={authPassword}
                 onChange={(e) => setAuthPassword(e.target.value)}
-                className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-blue-600"
+                className="w-full border border-gray-300 bg-white text-black font-medium rounded-lg px-3 py-2 text-sm focus:outline-blue-600"
               />
             </div>
 
@@ -525,14 +576,9 @@ export default function BillingApp() {
     );
   }
 
-  // Summary Metrics
   const totalSalesRevenue = invoices.reduce((sum, inv) => sum + Number(inv.grand_total || 0), 0);
-  const totalCashCollected = invoices
-    .filter((inv) => inv.payment_mode === "CASH")
-    .reduce((sum, inv) => sum + Number(inv.grand_total || 0), 0);
-  const totalUpiCollected = invoices
-    .filter((inv) => inv.payment_mode === "UPI")
-    .reduce((sum, inv) => sum + Number(inv.grand_total || 0), 0);
+  const totalCashCollected = invoices.filter((inv) => inv.payment_mode === "CASH").reduce((sum, inv) => sum + Number(inv.grand_total || 0), 0);
+  const totalUpiCollected = invoices.filter((inv) => inv.payment_mode === "UPI").reduce((sum, inv) => sum + Number(inv.grand_total || 0), 0);
   const totalTaxCollected = invoices.reduce((sum, inv) => sum + Number(inv.tax_amount || 0), 0);
   const totalOutstandingUdhar = parties.reduce((sum, p) => sum + Number(p.balance_due || 0), 0);
 
@@ -545,8 +591,8 @@ export default function BillingApp() {
           <div className="flex items-center space-x-2">
             <div>
               <span className="text-xl font-extrabold text-blue-600 tracking-tight">{profile.store_name}</span>
-              <span className="ml-2 text-xs bg-green-100 text-green-800 font-semibold px-2 py-0.5 rounded">
-                ☁ Live
+              <span className="ml-2 text-xs bg-purple-100 text-purple-800 font-semibold px-2 py-0.5 rounded uppercase">
+                {userRole}
               </span>
               <p className="text-xs text-gray-400">{user.email}</p>
             </div>
@@ -577,22 +623,36 @@ export default function BillingApp() {
             >
               📒 Udhar (₹{totalOutstandingUdhar.toFixed(0)})
             </button>
-            <button
-              onClick={() => setActiveTab("REPORTS")}
-              className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-md transition ${
-                activeTab === "REPORTS" ? "bg-white text-blue-600 shadow" : "text-gray-600"
-              }`}
-            >
-              📊 Reports
-            </button>
-            <button
-              onClick={() => setActiveTab("SETTINGS")}
-              className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-md transition ${
-                activeTab === "SETTINGS" ? "bg-white text-blue-600 shadow" : "text-gray-600"
-              }`}
-            >
-              ⚙️️ Settings
-            </button>
+
+            {userRole === "OWNER" && (
+              <>
+                <button
+                  onClick={() => setActiveTab("REPORTS")}
+                  className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-md transition ${
+                    activeTab === "REPORTS" ? "bg-white text-blue-600 shadow" : "text-gray-600"
+                  }`}
+                >
+                  📊 Reports
+                </button>
+                <button
+                  onClick={() => setActiveTab("STAFF")}
+                  className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-md transition ${
+                    activeTab === "STAFF" ? "bg-white text-blue-600 shadow" : "text-gray-600"
+                  }`}
+                >
+                  👥 Staff
+                </button>
+                <button
+                  onClick={() => setActiveTab("SETTINGS")}
+                  className={`px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-md transition ${
+                    activeTab === "SETTINGS" ? "bg-white text-blue-600 shadow" : "text-gray-600"
+                  }`}
+                >
+                  ⚙ Settings
+                </button>
+              </>
+            )}
+
             <button
               onClick={handleLogout}
               className="px-2 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 rounded"
@@ -603,33 +663,91 @@ export default function BillingApp() {
           </div>
         </header>
 
-        {/* =================== TAB: STORE PROFILE SETTINGS =================== */}
-        {activeTab === "SETTINGS" && (
+        {/* =================== TAB: STAFF MANAGEMENT (OWNER ONLY) =================== */}
+        {activeTab === "STAFF" && userRole === "OWNER" && (
           <div className="print:hidden bg-white p-6 rounded-lg shadow border space-y-6">
             <div>
-              <h2 className="text-xl font-bold text-gray-800">Store Profile & GST Configuration</h2>
-              <p className="text-xs text-gray-500">This information will appear on all your printed invoices and UPI QR slips.</p>
+              <h2 className="text-xl font-bold text-gray-800">Staff & Cashier Access Control</h2>
+              <p className="text-xs text-gray-500">Authorize cashiers to generate bills without giving them access to financial reports or store settings.</p>
+            </div>
+
+            <form onSubmit={handleAddStaff} className="flex gap-3">
+              <input
+                type="email"
+                required
+                placeholder="cashier@store.com"
+                value={newStaffEmail}
+                onChange={(e) => setNewStaffEmail(e.target.value)}
+                className="flex-1 border rounded px-3 py-2 text-sm bg-white text-black"
+              />
+              <select
+                value={newStaffRole}
+                onChange={(e) => setNewStaffRole(e.target.value as any)}
+                className="border rounded px-3 py-2 text-sm bg-white text-black"
+              >
+                <option value="CASHIER">Cashier (Billing Only)</option>
+                <option value="OWNER">Owner (Full Access)</option>
+              </select>
+              <button type="submit" className="bg-blue-600 text-white font-bold px-5 py-2 rounded text-sm hover:bg-blue-700">
+                + Add Staff
+              </button>
+            </form>
+
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="bg-gray-100 text-left">
+                  <th className="p-3 border">Staff Email</th>
+                  <th className="p-3 border">Assigned Role</th>
+                  <th className="p-3 border text-center w-24">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {staffList.map((st) => (
+                  <tr key={st.id} className="border-b">
+                    <td className="p-3 border font-medium">{st.staff_email}</td>
+                    <td className="p-3 border">
+                      <span className={`text-xs px-2 py-0.5 rounded font-bold ${st.role === 'OWNER' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
+                        {st.role}
+                      </span>
+                    </td>
+                    <td className="p-3 border text-center">
+                      <button onClick={() => handleRemoveStaff(st.id)} className="text-red-500 text-xs font-semibold hover:underline">
+                        Revoke
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* =================== TAB: SETTINGS (OWNER ONLY) =================== */}
+        {activeTab === "SETTINGS" && userRole === "OWNER" && (
+          <div className="print:hidden bg-white p-6 rounded-lg shadow border space-y-6">
+            <div>
+              <h2 className="text-xl font-bold text-gray-800">Store Profile & Printer Mode</h2>
+              <p className="text-xs text-gray-500">Configure your store details and choose between A4 Tax Invoice or 3-inch Thermal Receipt mode.</p>
             </div>
 
             <form onSubmit={handleSaveProfile} className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs font-semibold text-gray-600 mb-1">Business / Store Name *</label>
+                <label className="block text-xs font-semibold text-gray-600 mb-1">Store Name *</label>
                 <input
                   type="text"
                   required
                   value={profile.store_name}
                   onChange={(e) => setProfile({ ...profile, store_name: e.target.value })}
-                  className="w-full border rounded px-3 py-2 text-sm"
+                  className="w-full border rounded px-3 py-2 text-sm bg-white text-black"
                 />
               </div>
               <div>
                 <label className="block text-xs font-semibold text-gray-600 mb-1">GSTIN Number</label>
                 <input
                   type="text"
-                  placeholder="23AAAAA0000A1Z5"
                   value={profile.gstin}
                   onChange={(e) => setProfile({ ...profile, gstin: e.target.value.toUpperCase() })}
-                  className="w-full border rounded px-3 py-2 text-sm uppercase"
+                  className="w-full border rounded px-3 py-2 text-sm uppercase bg-white text-black"
                 />
               </div>
               <div>
@@ -638,75 +756,100 @@ export default function BillingApp() {
                   type="text"
                   value={profile.phone}
                   onChange={(e) => setProfile({ ...profile, phone: e.target.value })}
-                  className="w-full border rounded px-3 py-2 text-sm"
+                  className="w-full border rounded px-3 py-2 text-sm bg-white text-black"
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-gray-600 mb-1">UPI ID (For Instant Customer Payment)</label>
+                <label className="block text-xs font-semibold text-gray-600 mb-1">UPI ID (For QR Slip)</label>
                 <input
                   type="text"
-                  placeholder="yourstore@upi"
+                  placeholder="store@upi"
                   value={profile.upi_id}
                   onChange={(e) => setProfile({ ...profile, upi_id: e.target.value })}
-                  className="w-full border rounded px-3 py-2 text-sm"
-                />
-              </div>
-              <div className="md:col-span-2">
-                <label className="block text-xs font-semibold text-gray-600 mb-1">Full Store Address</label>
-                <textarea
-                  rows={2}
-                  value={profile.address}
-                  onChange={(e) => setProfile({ ...profile, address: e.target.value })}
-                  className="w-full border rounded px-3 py-2 text-sm"
+                  className="w-full border rounded px-3 py-2 text-sm bg-white text-black"
                 />
               </div>
               <div>
-                <label className="block text-xs font-semibold text-gray-600 mb-1">Home State Code (For CGST/SGST determination)</label>
+                <label className="block text-xs font-semibold text-gray-600 mb-1">Invoice / Receipt Layout</label>
+                <select
+                  value={profile.printer_mode}
+                  onChange={(e) => setProfile({ ...profile, printer_mode: e.target.value as any })}
+                  className="w-full border rounded px-3 py-2 text-sm bg-white text-black font-semibold"
+                >
+                  <option value="THERMAL">Thermal Printer (3-inch / 58mm POS Receipt)</option>
+                  <option value="A4">Standard A4 Tax Invoice</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-gray-600 mb-1">State Code</label>
                 <select
                   value={profile.state_code}
                   onChange={(e) => setProfile({ ...profile, state_code: e.target.value })}
-                  className="w-full border rounded px-3 py-2 text-sm"
+                  className="w-full border rounded px-3 py-2 text-sm bg-white text-black"
                 >
                   <option value="23">23 - Madhya Pradesh</option>
                   <option value="27">27 - Maharashtra</option>
                   <option value="07">07 - Delhi</option>
                   <option value="09">09 - Uttar Pradesh</option>
                   <option value="24">24 - Gujarat</option>
-                  <option value="08">08 - Rajasthan</option>
                 </select>
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-xs font-semibold text-gray-600 mb-1">Address</label>
+                <textarea
+                  rows={2}
+                  value={profile.address}
+                  onChange={(e) => setProfile({ ...profile, address: e.target.value })}
+                  className="w-full border rounded px-3 py-2 text-sm bg-white text-black"
+                />
               </div>
 
               <div className="md:col-span-2 flex justify-end">
                 <button type="submit" className="bg-blue-600 text-white font-bold px-6 py-2 rounded shadow hover:bg-blue-700">
-                  Save Store Profile
+                  Save Settings
                 </button>
               </div>
             </form>
           </div>
         )}
 
-        {/* =================== TAB: BILLING & POS (WITH BARCODE SCANNING) =================== */}
+        {/* =================== TAB: BILLING & POS (WITH THERMAL & A4 STYLES) =================== */}
         {activeTab === "BILLING" && (
-          <div className="bg-white rounded-lg shadow p-4 md:p-8 print:p-0 print:shadow-none print:border-none border">
+          <div className={`bg-white rounded-lg shadow border p-4 md:p-8 print:p-0 print:shadow-none print:border-none ${profile.printer_mode === 'THERMAL' ? 'print:max-w-[80mm]' : ''}`}>
 
-            {/* Print Header */}
-            <div className="hidden print:block border-b-2 border-black pb-4 mb-4">
-              <div className="flex justify-between items-start">
-                <div>
-                  <h1 className="text-xl font-black tracking-tight">{profile.store_name}</h1>
-                  <p className="text-xs text-gray-700">{profile.address}</p>
-                  <p className="text-xs font-semibold">Phone: {profile.phone}</p>
-                  {profile.gstin && <p className="text-xs font-bold mt-1">GSTIN: {profile.gstin}</p>}
-                </div>
-                <div className="text-right">
-                  <span className="border-2 border-black font-black text-sm px-3 py-1 uppercase inline-block">
-                    TAX INVOICE
-                  </span>
-                  <p className="text-xs font-bold mt-2">Invoice: {currentInvoiceNo}</p>
-                  <p className="text-xs">Date: {billDate}</p>
+            {/* --- THERMAL RECEIPT PRINT HEADER --- */}
+            {profile.printer_mode === 'THERMAL' && (
+              <div className="hidden print:block text-center font-mono text-xs pb-2 mb-2 border-b border-dashed border-black space-y-1">
+                <h1 className="text-sm font-black">{profile.store_name}</h1>
+                <p>{profile.address}</p>
+                <p>Ph: {profile.phone}</p>
+                {profile.gstin && <p>GSTIN: {profile.gstin}</p>}
+                <div className="text-left pt-2 font-semibold">
+                  <p>Inv: {currentInvoiceNo}</p>
+                  <p>Date: {billDate}</p>
+                  <p>Customer: {customerName || "Walk-in"}</p>
                 </div>
               </div>
-            </div>
+            )}
+
+            {/* --- A4 TAX INVOICE PRINT HEADER --- */}
+            {profile.printer_mode === 'A4' && (
+              <div className="hidden print:block border-b-2 border-black pb-4 mb-4">
+                <div className="flex justify-between items-start">
+                  <div>
+                    <h1 className="text-xl font-black tracking-tight">{profile.store_name}</h1>
+                    <p className="text-xs text-gray-700">{profile.address}</p>
+                    <p className="text-xs font-semibold">Phone: {profile.phone}</p>
+                    {profile.gstin && <p className="text-xs font-bold mt-1">GSTIN: {profile.gstin}</p>}
+                  </div>
+                  <div className="text-right">
+                    <span className="border-2 border-black font-black text-sm px-3 py-1 uppercase inline-block">TAX INVOICE</span>
+                    <p className="text-xs font-bold mt-2">Invoice: {currentInvoiceNo}</p>
+                    <p className="text-xs">Date: {billDate}</p>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Screen Header */}
             <div className="print:hidden flex justify-between items-center border-b pb-4 mb-4">
@@ -716,13 +859,13 @@ export default function BillingApp() {
               </div>
               <button
                 onClick={handleSaveAndPrint}
-                className="bg-emerald-600 text-white px-6 py-2.5 rounded font-semibold hover:bg-emerald-700 shadow"
+                className="bg-emerald-600 text-white px-6 py-2.5 rounded font-semibold hover:bg-emerald-700 shadow flex items-center space-x-2"
               >
-                🖨️ Save & Print Bill
+                <span>🖨️ Save & Print ({profile.printer_mode})</span>
               </button>
             </div>
 
-            {/* Fast Barcode Scanner Toolbar */}
+            {/* Barcode Scanner Toolbar */}
             <div className="print:hidden bg-slate-50 border p-3 rounded-lg mb-6 flex flex-col sm:flex-row items-center gap-3">
               <div className="flex-1 w-full flex gap-2">
                 <input
@@ -731,11 +874,9 @@ export default function BillingApp() {
                   value={barcodeSearch}
                   onChange={(e) => setBarcodeSearch(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      handleBarcodeLookup(barcodeSearch);
-                    }
+                    if (e.key === "Enter") handleBarcodeLookup(barcodeSearch);
                   }}
-                  className="w-full border rounded px-3 py-2 text-sm bg-white font-mono"
+                  className="w-full border rounded px-3 py-2 text-sm bg-white text-black font-mono"
                 />
                 <button
                   type="button"
@@ -756,7 +897,6 @@ export default function BillingApp() {
               </button>
             </div>
 
-            {/* Camera Viewport */}
             {cameraActive && (
               <div className="print:hidden mb-4 p-3 border rounded bg-black flex flex-col items-center">
                 <div id="reader" className="w-full max-w-sm"></div>
@@ -765,7 +905,7 @@ export default function BillingApp() {
             )}
 
             {/* Customer Inputs */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 mb-6 print:border print:p-3 print:mb-4 print:text-xs">
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 mb-6 print:border print:p-2 print:mb-2 print:text-[10px]">
               <div>
                 <label className="block text-xs font-semibold text-gray-600 mb-1">Customer Name *</label>
                 <input
@@ -773,7 +913,7 @@ export default function BillingApp() {
                   placeholder="Customer Name"
                   value={customerName}
                   onChange={(e) => setCustomerName(e.target.value)}
-                  className="w-full border rounded px-3 py-2 text-sm print:border-none print:p-0 print:font-bold"
+                  className="w-full border rounded px-3 py-2 text-sm bg-white text-black print:border-none print:p-0 print:font-bold"
                 />
               </div>
               <div>
@@ -783,7 +923,7 @@ export default function BillingApp() {
                   placeholder="Mobile No."
                   value={customerPhone}
                   onChange={(e) => setCustomerPhone(e.target.value)}
-                  className="w-full border rounded px-3 py-2 text-sm print:border-none print:p-0"
+                  className="w-full border rounded px-3 py-2 text-sm bg-white text-black print:border-none print:p-0"
                 />
               </div>
               <div>
@@ -791,7 +931,7 @@ export default function BillingApp() {
                 <select
                   value={customerState}
                   onChange={(e) => setCustomerState(e.target.value)}
-                  className="w-full border rounded px-3 py-2 text-sm print:border-none print:p-0"
+                  className="w-full border rounded px-3 py-2 text-sm bg-white text-black print:border-none print:p-0"
                 >
                   <option value={profile.state_code}>Same State (CGST + SGST)</option>
                   <option value="99">Other State (IGST)</option>
@@ -802,7 +942,7 @@ export default function BillingApp() {
                 <select
                   value={paymentMode}
                   onChange={(e) => setPaymentMode(e.target.value as any)}
-                  className={`w-full border rounded px-3 py-2 text-sm font-semibold print:border-none print:p-0 ${
+                  className={`w-full border rounded px-3 py-2 text-sm font-semibold bg-white text-black print:border-none print:p-0 ${
                     paymentMode === "CREDIT" ? "bg-red-50 text-red-700 border-red-300" : ""
                   }`}
                 >
@@ -815,33 +955,31 @@ export default function BillingApp() {
 
             {/* Bill Table */}
             <div className="overflow-x-auto">
-              <table className="w-full border-collapse mb-4 text-sm print:text-xs">
+              <table className="w-full border-collapse mb-4 text-sm print:text-[10px]">
                 <thead>
-                  <tr className="bg-gray-100 text-left text-gray-700 print:bg-white print:border-b-2 print:border-black">
+                  <tr className="bg-gray-100 text-left text-gray-700 print:bg-white print:border-b print:border-black">
                     <th className="print:hidden p-2 border">Pick Stock</th>
-                    <th className="p-2 border">Item Description</th>
-                    <th className="p-2 border w-20">HSN</th>
-                    <th className="p-2 border w-16 text-center">Qty</th>
-                    <th className="p-2 border w-24 text-right">Rate (₹)</th>
-                    <th className="p-2 border w-20 text-center">GST %</th>
-                    <th className="p-2 border w-28 text-right">Total (₹)</th>
-                    <th className="print:hidden p-2 border w-12 text-center"></th>
+                    <th className="p-2 border">Item</th>
+                    <th className="p-2 border w-16">HSN</th>
+                    <th className="p-2 border w-12 text-center">Qty</th>
+                    <th className="p-2 border w-20 text-right">Rate</th>
+                    <th className="p-2 border w-16 text-center">GST</th>
+                    <th className="p-2 border w-24 text-right">Total</th>
+                    <th className="print:hidden p-2 border w-10 text-center"></th>
                   </tr>
                 </thead>
                 <tbody>
                   {items.map((item, idx) => (
                     <tr key={idx} className="border-b">
-                      <td className="print:hidden p-2 border w-44">
+                      <td className="print:hidden p-2 border w-40">
                         <select
                           onChange={(e) => selectProductForItem(idx, Number(e.target.value))}
                           value={item.productId || ""}
-                          className="w-full border rounded px-2 py-1 text-xs"
+                          className="w-full border rounded px-2 py-1 text-xs bg-white text-black"
                         >
                           <option value="">-- Stock --</option>
                           {inventory.map((inv) => (
-                            <option key={inv.id} value={inv.id}>
-                              {inv.name} ({inv.stock})
-                            </option>
+                            <option key={inv.id} value={inv.id}>{inv.name} ({inv.stock})</option>
                           ))}
                         </select>
                       </td>
@@ -850,7 +988,7 @@ export default function BillingApp() {
                           type="text"
                           value={item.name}
                           onChange={(e) => updateItemRow(idx, "name", e.target.value)}
-                          className="w-full border rounded px-2 py-1 text-sm print:border-none print:p-0"
+                          className="w-full border rounded px-2 py-1 text-sm bg-white text-black print:border-none print:p-0"
                         />
                       </td>
                       <td className="p-2 border">
@@ -858,7 +996,7 @@ export default function BillingApp() {
                           type="text"
                           value={item.hsn}
                           onChange={(e) => updateItemRow(idx, "hsn", e.target.value)}
-                          className="w-full border rounded px-2 py-1 text-sm print:border-none print:p-0"
+                          className="w-full border rounded px-2 py-1 text-sm bg-white text-black print:border-none print:p-0"
                         />
                       </td>
                       <td className="p-2 border text-center">
@@ -867,7 +1005,7 @@ export default function BillingApp() {
                           min="1"
                           value={item.qty}
                           onChange={(e) => updateItemRow(idx, "qty", Math.max(1, Number(e.target.value)))}
-                          className="w-full border rounded px-2 py-1 text-sm text-center print:border-none print:p-0"
+                          className="w-full border rounded px-2 py-1 text-sm text-center bg-white text-black print:border-none print:p-0"
                         />
                       </td>
                       <td className="p-2 border text-right">
@@ -875,14 +1013,14 @@ export default function BillingApp() {
                           type="number"
                           value={item.rate}
                           onChange={(e) => updateItemRow(idx, "rate", Number(e.target.value))}
-                          className="w-full border rounded px-2 py-1 text-sm text-right print:border-none print:p-0"
+                          className="w-full border rounded px-2 py-1 text-sm text-right bg-white text-black print:border-none print:p-0"
                         />
                       </td>
                       <td className="p-2 border text-center">
                         <select
                           value={item.gstRate}
                           onChange={(e) => updateItemRow(idx, "gstRate", Number(e.target.value))}
-                          className="w-full border rounded px-1 py-1 text-sm print:border-none print:p-0 text-center"
+                          className="w-full border rounded px-1 py-1 text-sm bg-white text-black print:border-none print:p-0 text-center"
                         >
                           <option value={0}>0%</option>
                           <option value={5}>5%</option>
@@ -891,13 +1029,9 @@ export default function BillingApp() {
                           <option value={28}>28%</option>
                         </select>
                       </td>
-                      <td className="p-2 border text-right font-medium">
-                        {(item.qty * item.rate).toFixed(2)}
-                      </td>
+                      <td className="p-2 border text-right font-medium">{(item.qty * item.rate).toFixed(2)}</td>
                       <td className="print:hidden p-2 border text-center">
-                        <button onClick={() => removeItemRow(idx)} className="text-red-500 font-bold">
-                          ✕
-                        </button>
+                        <button onClick={() => removeItemRow(idx)} className="text-red-500 font-bold">✕</button>
                       </td>
                     </tr>
                   ))}
@@ -912,9 +1046,9 @@ export default function BillingApp() {
               + Add Item Row
             </button>
 
-            {/* Calculations & Print Footer */}
-            <div className="border-t pt-4 flex flex-col md:flex-row justify-between items-start md:items-end print:text-xs">
-              <div className="mb-4 md:mb-0 space-y-2">
+            {/* Calculations & Signatory Footer */}
+            <div className="border-t pt-4 flex flex-col md:flex-row justify-between items-start md:items-end print:text-[10px]">
+              <div className="mb-4 md:mb-0 space-y-1">
                 <div>
                   <span className="text-xs font-semibold text-gray-500 block">Payment Mode:</span>
                   <span className="text-sm font-bold text-gray-800">
@@ -922,22 +1056,22 @@ export default function BillingApp() {
                   </span>
                 </div>
 
-                {/* Print UPI QR Code placeholder if UPI configured */}
-                {profile.upi_id && (
-                  <div className="hidden print:block pt-2">
-                    <p className="text-[10px] text-gray-500">Pay via UPI to: <b>{profile.upi_id}</b></p>
+                {profile.upi_id && profile.printer_mode === 'THERMAL' && (
+                  <div className="hidden print:block pt-1 font-mono">
+                    <p>UPI ID: {profile.upi_id}</p>
+                    <p className="text-[9px]">Scan & Pay via any UPI app</p>
                   </div>
                 )}
 
-                <div className="hidden print:block pt-6">
-                  <p className="text-xs text-gray-500">Thank you for your business!</p>
-                  <p className="text-xs font-bold mt-4 pt-4 border-t border-gray-400">Authorized Signatory</p>
+                <div className="hidden print:block pt-4">
+                  <p className="text-[10px]">Thank you! Visit again.</p>
+                  <p className="font-bold mt-2 pt-2 border-t border-black">Authorized Signatory</p>
                 </div>
               </div>
 
-              <div className="w-full md:w-80 space-y-2 text-sm bg-gray-50 print:bg-white p-4 rounded border">
+              <div className="w-full md:w-80 space-y-1 text-sm bg-gray-50 print:bg-white p-4 rounded border print:border-none print:p-0">
                 <div className="flex justify-between">
-                  <span className="text-gray-600">Taxable Subtotal:</span>
+                  <span className="text-gray-600">Subtotal:</span>
                   <span className="font-semibold">₹{subtotal.toFixed(2)}</span>
                 </div>
                 {isIntraState ? (
@@ -957,7 +1091,7 @@ export default function BillingApp() {
                     <span>₹{igstTotal.toFixed(2)}</span>
                   </div>
                 )}
-                <div className="flex justify-between border-t-2 border-black pt-2 text-lg font-bold text-gray-900">
+                <div className="flex justify-between border-t-2 border-black pt-2 text-lg font-bold text-gray-900 print:text-sm">
                   <span>Grand Total:</span>
                   <span>₹{grandTotal}</span>
                 </div>
@@ -966,7 +1100,7 @@ export default function BillingApp() {
           </div>
         )}
 
-        {/* =================== TAB: INVENTORY (WITH BARCODE FIELD) =================== */}
+        {/* =================== TAB: INVENTORY =================== */}
         {activeTab === "INVENTORY" && (
           <div className="print:hidden space-y-6">
             <div className="bg-white p-6 rounded-lg shadow border">
@@ -980,7 +1114,7 @@ export default function BillingApp() {
                     placeholder="Product name"
                     value={newProdName}
                     onChange={(e) => setNewProdName(e.target.value)}
-                    className="w-full border rounded px-3 py-1.5 text-sm"
+                    className="w-full border rounded px-3 py-1.5 text-sm bg-white text-black"
                   />
                 </div>
                 <div>
@@ -990,7 +1124,7 @@ export default function BillingApp() {
                     placeholder="8901030..."
                     value={newProdBarcode}
                     onChange={(e) => setNewProdBarcode(e.target.value)}
-                    className="w-full border rounded px-3 py-1.5 text-sm font-mono"
+                    className="w-full border rounded px-3 py-1.5 text-sm font-mono bg-white text-black"
                   />
                 </div>
                 <div>
@@ -1000,7 +1134,7 @@ export default function BillingApp() {
                     placeholder="HSN"
                     value={newProdHsn}
                     onChange={(e) => setNewProdHsn(e.target.value)}
-                    className="w-full border rounded px-3 py-1.5 text-sm"
+                    className="w-full border rounded px-3 py-1.5 text-sm bg-white text-black"
                   />
                 </div>
                 <div>
@@ -1010,7 +1144,7 @@ export default function BillingApp() {
                     placeholder="0.00"
                     value={newProdSaleRate}
                     onChange={(e) => setNewProdSaleRate(e.target.value === "" ? "" : Number(e.target.value))}
-                    className="w-full border rounded px-3 py-1.5 text-sm"
+                    className="w-full border rounded px-3 py-1.5 text-sm bg-white text-black"
                   />
                 </div>
                 <div>
@@ -1018,7 +1152,7 @@ export default function BillingApp() {
                   <select
                     value={newProdGst}
                     onChange={(e) => setNewProdGst(Number(e.target.value))}
-                    className="w-full border rounded px-3 py-1.5 text-sm"
+                    className="w-full border rounded px-3 py-1.5 text-sm bg-white text-black"
                   >
                     <option value={0}>0%</option>
                     <option value={5}>5%</option>
@@ -1034,7 +1168,7 @@ export default function BillingApp() {
                     placeholder="0"
                     value={newProdStock}
                     onChange={(e) => setNewProdStock(e.target.value === "" ? "" : Number(e.target.value))}
-                    className="w-full border rounded px-3 py-1.5 text-sm"
+                    className="w-full border rounded px-3 py-1.5 text-sm bg-white text-black"
                   />
                 </div>
                 <div className="sm:col-span-7 flex justify-end mt-2">
@@ -1116,9 +1250,7 @@ export default function BillingApp() {
                       <tr key={party.id} className="border-b hover:bg-gray-50">
                         <td className="p-3 border font-semibold">{party.name}</td>
                         <td className="p-3 border text-gray-600">{party.phone}</td>
-                        <td className="p-3 border text-right font-bold text-red-600">
-                          ₹{Number(party.balance_due).toFixed(2)}
-                        </td>
+                        <td className="p-3 border text-right font-bold text-red-600">₹{Number(party.balance_due).toFixed(2)}</td>
                         <td className="p-3 border text-center">
                           <input
                             type="number"
@@ -1130,7 +1262,7 @@ export default function BillingApp() {
                                 [party.id]: e.target.value === "" ? "" : Number(e.target.value),
                               })
                             }
-                            className="w-28 border rounded px-2 py-1 text-sm text-center"
+                            className="w-28 border rounded px-2 py-1 text-sm text-center bg-white text-black"
                           />
                         </td>
                         <td className="p-3 border text-center">
@@ -1150,14 +1282,13 @@ export default function BillingApp() {
           </div>
         )}
 
-        {/* =================== TAB: REPORTS =================== */}
-        {activeTab === "REPORTS" && (
+        {/* =================== TAB: REPORTS (OWNER ONLY) =================== */}
+        {activeTab === "REPORTS" && userRole === "OWNER" && (
           <div className="print:hidden space-y-6">
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div className="bg-white p-4 rounded-lg shadow border-l-4 border-blue-600">
                 <div className="text-xs text-gray-500 font-bold uppercase">Total Lifetime Sales</div>
                 <div className="text-2xl font-extrabold text-blue-700">₹{totalSalesRevenue.toFixed(2)}</div>
-                <div className="text-xs text-gray-400 mt-1">{invoices.length} Invoices</div>
               </div>
               <div className="bg-white p-4 rounded-lg shadow border-l-4 border-green-600">
                 <div className="text-xs text-gray-500 font-bold uppercase">Cash Collected</div>
@@ -1174,16 +1305,16 @@ export default function BillingApp() {
             </div>
 
             <div className="bg-white p-6 rounded-lg shadow border">
-              <h2 className="text-lg font-bold text-gray-800 mb-4">Invoice History (Day Book)</h2>
+              <h2 className="text-lg font-bold text-gray-800 mb-4">Invoice History</h2>
               <table className="w-full border-collapse text-sm">
                 <thead>
                   <tr className="bg-gray-100 text-left text-gray-700">
                     <th className="p-3 border">Inv No.</th>
                     <th className="p-3 border">Customer</th>
-                    <th className="p-3 border">Date & Time</th>
+                    <th className="p-3 border">Date</th>
                     <th className="p-3 border">Mode</th>
                     <th className="p-3 border text-right">Tax (₹)</th>
-                    <th className="p-3 border text-right">Grand Total (₹)</th>
+                    <th className="p-3 border text-right">Total (₹)</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1191,14 +1322,8 @@ export default function BillingApp() {
                     <tr key={inv.id} className="border-b hover:bg-gray-50">
                       <td className="p-3 border font-mono font-semibold text-blue-600">{inv.invoice_number}</td>
                       <td className="p-3 border font-medium">{inv.customer_name}</td>
-                      <td className="p-3 border text-gray-500 text-xs">
-                        {new Date(inv.created_at).toLocaleString("en-IN")}
-                      </td>
-                      <td className="p-3 border">
-                        <span className="text-xs px-2 py-0.5 rounded font-semibold bg-gray-100">
-                          {inv.payment_mode}
-                        </span>
-                      </td>
+                      <td className="p-3 border text-gray-500 text-xs">{new Date(inv.created_at).toLocaleString("en-IN")}</td>
+                      <td className="p-3 border"><span className="text-xs px-2 py-0.5 rounded font-semibold bg-gray-100">{inv.payment_mode}</span></td>
                       <td className="p-3 border text-right">₹{Number(inv.tax_amount).toFixed(2)}</td>
                       <td className="p-3 border text-right font-bold">₹{Number(inv.grand_total).toFixed(2)}</td>
                     </tr>
